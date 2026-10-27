@@ -2,7 +2,6 @@
 
 FastAPI + PostgreSQL + Worker + APScheduler + Playwright/Chromium + armazenamento por bind mount. **Não contém Dataset, tokens de API  nem callbacks.** A API pública do  permite navegação via navegador autenticado; os relatórios podem vir de um host diferente.
 
-> **Status:** pacote completo para desenvolvimento e homologação, **não validado ponta a ponta no portal autenticado do cliente**. Seletores de abas/portais, acesso ao Jasper na porta 8082, carregamento histórico e autenticação são dependentes do site. Não afirmar que a carga histórica cobriu 100% sem comparar contagens por aba e registros.
 
 ## Regras de negócio
 
