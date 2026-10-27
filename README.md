@@ -1,6 +1,6 @@
-# SoftExpert Portal Exporter — scraping exclusivo (Python 3.14)
+# Portal Exporter — scraping exclusivo (Python 3.14)
 
-FastAPI + PostgreSQL + Worker + APScheduler + Playwright/Chromium + armazenamento por bind mount. **Não contém Dataset, tokens de API SoftExpert nem callbacks.** A API pública do SoftExpert permite navegação via navegador autenticado; os relatórios podem vir de um host diferente.
+FastAPI + PostgreSQL + Worker + APScheduler + Playwright/Chromium + armazenamento por bind mount. **Não contém Dataset, tokens de API  nem callbacks.** A API pública do  permite navegação via navegador autenticado; os relatórios podem vir de um host diferente.
 
 > **Status:** pacote completo para desenvolvimento e homologação, **não validado ponta a ponta no portal autenticado do cliente**. Seletores de abas/portais, acesso ao Jasper na porta 8082, carregamento histórico e autenticação são dependentes do site. Não afirmar que a carga histórica cobriu 100% sem comparar contagens por aba e registros.
 
@@ -29,8 +29,8 @@ O Scheduler cria Job `incremental` com janela explícita no PostgreSQL. A mesma 
 Use uma pasta NOVA e NÃO reutilize volume PostgreSQL de projetos anteriores. As migrations deste projeto são novas e incompatíveis com o esquema legado:
 
 ```bash
-unzip softexpert-portal-exporter-clean.zip -d ~/projects
-cd ~/projects/softexpert-portal-exporter-clean
+unzip -portal-exporter-clean.zip -d ~/projects
+cd ~/projects/-portal-exporter-clean
 cp .env.example .env
 mkdir -p runtime/share
 nano .env
@@ -111,7 +111,7 @@ docker compose exec db psql -U exporter -d exporter -c \
 ## Segurança e produção
 
 - Para o navegador, instale Chromium (Dockerfile já instala). Não automatize MFA sem aprovação. A conta de scraping precisa visualizar todos os portais.
-- O host de relatórios em **HTTP:8082** precisa ser acessível pela EC2; valide política de segurança e possível autenticação adicional. A VPN tratada anteriormente é somente para a pasta SMB, não para o SoftExpert público.
+- O host de relatórios em **HTTP:8082** precisa ser acessível pela EC2; valide política de segurança e possível autenticação adicional. A VPN tratada anteriormente é somente para a pasta SMB, não para o  público.
 - Em produção monte SMB/CIFS **no host EC2**, confirme `findmnt -T /mnt/client-share -t cifs` e depois bind mount `/mnt/client-share:/mnt/client-share` **somente no Worker**. Ative `NETWORK_SHARE_REQUIRE_SENTINEL=true` e crie o sentinel exclusivamente no servidor SMB. O sentinel **não prova** montagem remota sozinho; valide o host antes de iniciar Docker e a cada reinício.
 - Credenciais de portal no `.env` apenas para desenvolvimento; em produção busque-as em armazenamento seguro e injete-as antes de executar Docker. Evite colocá-las em Terraform State, imagens ou repositório.
 - O Nginx local só publica em loopback. Em produção não exponha a API sem TLS e controle de origem/autenticação.
@@ -119,6 +119,6 @@ docker compose exec db psql -U exporter -d exporter -c \
 
 ## Estrutura
 
-`src/softexpert_exporter/` possui API (`interfaces/api.py`), Worker (`worker.py`), agendador (`scheduler.py`), aplicação de exportação (`application/portal.py`), crawler Playwright (`infrastructure/portal_scraper.py`), banco PostgreSQL (`infrastructure/db.py`), armazenamento em disco/SMB (`infrastructure/storage.py`) e regras de janela (`date_windows.py`).
+`src/_exporter/` possui API (`interfaces/api.py`), Worker (`worker.py`), agendador (`scheduler.py`), aplicação de exportação (`application/portal.py`), crawler Playwright (`infrastructure/portal_scraper.py`), banco PostgreSQL (`infrastructure/db.py`), armazenamento em disco/SMB (`infrastructure/storage.py`) e regras de janela (`date_windows.py`).
 
 O Terraform em `infra/terraform/` é base de EC2/RDS/ECR e **não configura VPN Site-to-Site automaticamente**, pois depende do gateway e da política de rede do cliente.
