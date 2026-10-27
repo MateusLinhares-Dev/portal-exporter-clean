@@ -1,0 +1,43 @@
+services:
+  migrate:
+    image: ${APP_IMAGE}
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+  api:
+    image: ${APP_IMAGE}
+    env_file: .env
+    command: ["uvicorn", "softexpert_exporter.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - /mnt/client-share:/mnt/client-share
+    restart: unless-stopped
+  worker:
+    image: ${APP_IMAGE}
+    env_file: .env
+    command: ["python", "-m", "softexpert_exporter.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - /mnt/client-share:/mnt/client-share
+    restart: unless-stopped
+  scheduler:
+    image: ${APP_IMAGE}
+    env_file: .env
+    command: ["python", "-m", "softexpert_exporter.scheduler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  nginx:
+    image: nginx:1.29-alpine
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
