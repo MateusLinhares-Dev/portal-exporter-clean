@@ -31,6 +31,9 @@ class SyncJobModel(Base):
     skipped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_summary: Mapped[str | None] = mapped_column(Text)
+    report_path: Mapped[str | None] = mapped_column(Text)
+    report_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    report_error: Mapped[str | None] = mapped_column(Text)
 
 class ExtractionModel(Base):
     __tablename__ = 'extractions'
@@ -52,6 +55,29 @@ class ExtractionModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
+class JobAuditEventModel(Base):
+    """Append-only, per-attempt audit; never overwritten by de-duplication."""
+    __tablename__ = 'job_audit_events'
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    tab: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    portal_path: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    document_id: Mapped[str] = mapped_column(String(255), nullable=False, default='')
+    document_code: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    document_date: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    unit: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    source_url: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    file_name: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    destination_path: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), nullable=False, default='')
+    message: Mapped[str] = mapped_column(Text, nullable=False, default='')
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 def _job(model: SyncJobModel) -> SyncJob:
     return SyncJob(id=model.id, status=JobStatus(model.status), requested_by=model.requested_by,
                    mode=model.mode, options=model.options or {}, created_at=model.created_at,
@@ -59,7 +85,8 @@ def _job(model: SyncJobModel) -> SyncJob:
                    heartbeat_at=model.heartbeat_at, attempts=model.attempts,
                    next_attempt_at=model.next_attempt_at, total_records=model.total_records,
                    downloaded=model.downloaded, skipped=model.skipped, failed=model.failed,
-                   error_summary=model.error_summary)
+                   error_summary=model.error_summary, report_path=model.report_path,
+                   report_generated_at=model.report_generated_at, report_error=model.report_error)
 
 class SqlAlchemyJobRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
@@ -122,8 +149,8 @@ class SqlAlchemyJobRepository:
             await session.commit()
 
     async def complete_job(self, job_id: str, *, total_records: int, downloaded: int,
-                           skipped: int, failed: int, error_summary: str | None) -> SyncJob:
-        status = JobStatus.SUCCEEDED if failed == 0 else JobStatus.PARTIAL if downloaded or skipped else JobStatus.FAILED
+                           skipped: int, failed: int, error_summary: str | None, validated: int = 0) -> SyncJob:
+        status = JobStatus.SUCCEEDED if failed == 0 else JobStatus.PARTIAL if downloaded or skipped or validated else JobStatus.FAILED
         async with self.factory() as session:
             model = await session.get(SyncJobModel, job_id)
             if model is None: raise LookupError(job_id)
@@ -210,6 +237,50 @@ class SqlAlchemyJobRepository:
               if status is ExtractionStatus.FAILED else None)
         async with self.factory() as session:
             await session.execute(stmt)
+            await session.commit()
+
+    async def audit_event(self, *, job_id: str, attempt: int, kind: str,
+                          status: str, descriptor: ReportDescriptor | None = None,
+                          tab: str = '', portal_path: str = '', file_name: str = '',
+                          destination_path: str = '', size_bytes: int | None = None,
+                          checksum_sha256: str = '', message: str = '') -> None:
+        desc = descriptor
+        async with self.factory() as session:
+            session.add(JobAuditEventModel(
+                job_id=job_id, attempt=attempt, kind=kind, status=status,
+                tab=desc.tab if desc else tab,
+                portal_path=' / '.join(desc.portal_path) if desc else portal_path,
+                document_id=desc.document_id if desc else '',
+                document_code=desc.code if desc else '',
+                document_date=desc.date if desc else '',
+                unit=desc.unit if desc else '',
+                source_url=desc.url if desc else '',
+                file_name=file_name, destination_path=destination_path,
+                size_bytes=size_bytes, checksum_sha256=checksum_sha256,
+                message=message[:4000], occurred_at=datetime.now(UTC),
+            ))
+            await session.commit()
+
+    async def list_audit_events(self, job_id: str) -> list[dict[str, Any]]:
+        async with self.factory() as session:
+            result = await session.scalars(select(JobAuditEventModel)
+                .where(JobAuditEventModel.job_id == job_id)
+                .order_by(JobAuditEventModel.id))
+            return [
+                {field: getattr(event, field) for field in (
+                    'attempt', 'kind', 'status', 'tab', 'portal_path', 'document_id',
+                    'document_code', 'document_date', 'unit', 'source_url',
+                    'file_name', 'destination_path', 'size_bytes',
+                    'checksum_sha256', 'message', 'occurred_at')}
+                for event in result
+            ]
+
+    async def record_report_result(self, job_id: str, *, path: str | None = None,
+                                   error: str | None = None) -> None:
+        async with self.factory() as session:
+            await session.execute(update(SyncJobModel).where(SyncJobModel.id == job_id).values(
+                report_path=path, report_generated_at=datetime.now(UTC) if path else None,
+                report_error=error[:4000] if error else None))
             await session.commit()
 
     async def healthcheck(self) -> bool:

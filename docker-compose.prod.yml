@@ -23,6 +23,8 @@ services:
         condition: service_completed_successfully
     volumes:
       - /mnt/client-share:/mnt/client-share
+    tmpfs:
+      - /tmp/softexpert-exporter:rw,nosuid,nodev,size=256m,mode=1777
     restart: unless-stopped
   scheduler:
     image: ${APP_IMAGE}

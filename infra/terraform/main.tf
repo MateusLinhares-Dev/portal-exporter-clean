@@ -5,6 +5,29 @@ locals {
   })
 }
 
+data "aws_ssm_parameter" "amazon_linux_2023" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+}
+
+data "aws_vpc" "custom_vpc" {
+  filter {
+    name   = "tag:Name"
+    values = ["OnDemandDev-vpc"]
+  }
+}
+
+data "aws_subnets" "private_subnets" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.custom_vpc.id]
+  }
+
+  filter {
+    name   = "tag:Name"
+    values = ["*private1*", "*private3*"]
+  }
+}
+
 resource "random_password" "db" {
   length           = 32
   special          = true
@@ -35,7 +58,7 @@ resource "aws_ecr_repository" "app" {
 resource "aws_security_group" "app" {
   name_prefix = "${var.project_name}-app-"
   description = "Application security group"
-  vpc_id      = var.vpc_id
+  vpc_id      = data.aws_vpc.custom_vpc.id
 
   dynamic "ingress" {
     for_each = toset(var.api_ingress_cidrs)
@@ -62,7 +85,7 @@ resource "aws_security_group" "app" {
 resource "aws_security_group" "db" {
   name_prefix = "${var.project_name}-db-"
   description = "RDS PostgreSQL security group"
-  vpc_id      = var.vpc_id
+  vpc_id      = data.aws_vpc.custom_vpc.id
 
   ingress {
     description     = "PostgreSQL from application"
@@ -84,7 +107,7 @@ resource "aws_security_group" "db" {
 
 resource "aws_db_subnet_group" "main" {
   name       = "${var.project_name}-db"
-  subnet_ids = var.db_subnet_ids
+  subnet_ids = sort(data.aws_subnets.private_subnets.ids)
   tags       = local.common_tags
 }
 
@@ -187,7 +210,7 @@ resource "aws_iam_role_policy" "app_runtime" {
 }
 
 resource "aws_instance" "app" {
-  ami                         = var.ami_id
+  ami                         = data.aws_ssm_parameter.amazon_linux_2023.value
   instance_type               = var.instance_type
   subnet_id                   = var.app_subnet_id
   vpc_security_group_ids      = [aws_security_group.app.id]

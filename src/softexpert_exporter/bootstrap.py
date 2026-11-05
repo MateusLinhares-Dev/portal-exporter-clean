@@ -23,6 +23,7 @@ def build_container() -> Container:
     repository = SqlAlchemyJobRepository(factory)
     storage = NetworkShareStorage(settings.NETWORK_SHARE_ROOT,
                                  require_sentinel=settings.NETWORK_SHARE_REQUIRE_SENTINEL,
+                                 require_cifs=settings.NETWORK_SHARE_REQUIRE_CIFS,
                                  sentinel_name=settings.NETWORK_SHARE_SENTINEL_NAME)
     return Container(settings, factory, repository, storage,
                      PortalScrapeUseCase(settings=settings, storage=storage, repository=repository))

@@ -25,14 +25,38 @@ def safe_relative_path(path: str) -> str:
     return '/'.join(parts)
 
 class NetworkShareStorage:
-    def __init__(self, root: Path, *, require_sentinel: bool, sentinel_name: str):
+    def __init__(self, root: Path, *, require_sentinel: bool, sentinel_name: str,
+                 require_cifs: bool = False):
         self.root = root
         self.require_sentinel = require_sentinel
         self.sentinel_name = sanitize_component(sentinel_name)
+        self.require_cifs = require_cifs
+
+    def _assert_cifs_mount(self) -> None:
+        root = self.root.resolve()
+        matched = ('', '')
+        try:
+            for line in Path('/proc/self/mountinfo').read_text().splitlines():
+                left, separator, right = line.partition(' - ')
+                if not separator:
+                    continue
+                fields = left.split()
+                if len(fields) < 5:
+                    continue
+                target = Path(fields[4].replace('\\040', ' ').replace('\\011', '\t'))
+                if target == root or target in root.parents:
+                    if len(str(target)) > len(matched[0]):
+                        matched = (str(target), right.split()[0])
+        except (OSError, IndexError) as exc:
+            raise OSError('Cannot verify CIFS mount') from exc
+        if matched[1].lower() not in {'cifs', 'smb3', 'smbfs'}:
+            raise OSError(f'CIFS mount required at {root}; filesystem={matched[1] or "unknown"}')
 
     def _assert_ready(self) -> None:
         if not self.root.is_dir():
             raise OSError(f'Share directory missing: {self.root}')
+        if self.require_cifs:
+            self._assert_cifs_mount()
         if self.require_sentinel and not (self.root / self.sentinel_name).is_file():
             raise OSError('Share sentinel missing; refusing local fallback')
 
@@ -63,6 +87,7 @@ class NetworkShareStorage:
             dst.parent.mkdir(parents=True, exist_ok=True)
             try:
                 shutil.copyfile(source, temp)
+                self._assert_ready()
                 os.replace(temp, dst)
             finally:
                 temp.unlink(missing_ok=True)

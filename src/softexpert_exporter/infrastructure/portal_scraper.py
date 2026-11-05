@@ -8,11 +8,14 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 import structlog
-from playwright.async_api import BrowserContext, Page, async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import BrowserContext, Page, async_playwright
 
 from softexpert_exporter.domain.models import ReportDescriptor, SyncJob
 
 logger = structlog.get_logger(__name__)
+
+class PortalSessionExpired(RuntimeError):
+    pass
 
 TAB_SELECTOR = '[class*="FolderTabItemContent_tabContainer"], [role="tab"]'
 
@@ -81,9 +84,16 @@ class PortalCrawler:
                 continue
         return False
 
+    async def _ensure_session(self, page: Page) -> None:
+        if await page.locator('#password').is_visible():
+            raise PortalSessionExpired(
+                f'Portal session expired; redirected to {urlsplit(page.url).path}'
+            )
+
     async def _wait_tab_dom(self, page: Page) -> None:
         deadline = asyncio.get_running_loop().time() + self.settings.PORTAL_TIMEOUT_MS / 1000
         while asyncio.get_running_loop().time() < deadline:
+            await self._ensure_session(page)
             if await self._portal_is_ready(page):
                 return
             await asyncio.sleep(0.3)
@@ -94,14 +104,11 @@ class PortalCrawler:
 
     async def _settle_after_navigation(self, page: Page) -> None:
         await page.wait_for_timeout(900)
-
-        await self._scroll_dashboards(page)
-
         stable = 0
         previous = None
         deadline = asyncio.get_running_loop().time() + min(8, self.settings.PORTAL_TIMEOUT_MS / 1000)
-
         while asyncio.get_running_loop().time() < deadline:
+            await self._ensure_session(page)
             state = []
             for frame in page.frames:
                 try:
@@ -128,7 +135,7 @@ class PortalCrawler:
             if await page.locator('#password').is_visible():
                 if allow_login:
                     return 'login'
-                raise RuntimeError(
+                raise PortalSessionExpired(
                     f'Authentication is not active in this browser tab; '
                     f'portal redirected to {page.url}. Check session cookies, '
                     f'sessionStorage, account permissions and MFA.'
@@ -183,7 +190,7 @@ class PortalCrawler:
                             break
             except Exception:
                 pass
-
+        
         protected = [self.settings.PORTAL_PASSWORD, self.settings.PORTAL_USERNAME]
         sanitized: list[str] = []
         for value in messages:
@@ -199,7 +206,7 @@ class PortalCrawler:
         try:
             from pathlib import Path
             screenshot = Path(self.settings.NETWORK_SHARE_ROOT) / '_portal_login_debug.png'
-
+            
             for selector in ('#user', '#password'):
                 field = page.locator(selector)
                 if await field.count():
@@ -210,16 +217,23 @@ class PortalCrawler:
             logger.warning('login_screenshot_unavailable', error_type=type(exc).__name__)
             return None
 
-    async def _confirm_popup_login(self, page: Page) -> None:
-        try:
-            logger.info('portal_login_popup_waiting', path=urlsplit(page.url).path)
-            button_confirm = page.locator("#alertConfirm")
-            await button_confirm.wait_for(state='visible', timeout=3500)
-            logger.info('portal_login_popup_visible', path=urlsplit(page.url).path)
-            await button_confirm.click()
-        except PlaywrightTimeoutError:
-            logger.warning('portal_login_popup_timeout', path=urlsplit(page.url).path)
-            return
+    async def _confirm_existing_session(self, page: Page) -> bool:
+        for frame in page.frames:
+            try:
+                confirm = frame.locator('#alertConfirm')
+                if not await confirm.is_visible():
+                    continue
+                message = frame.get_by_text(
+                    'Usuário conectado. Deseja desconectar?', exact=False
+                ).first
+                if not await message.is_visible():
+                    continue
+                await confirm.click(timeout=5000)
+                logger.info('portal_existing_session_confirmed')
+                return True
+            except Exception as exc:
+                logger.debug('portal_session_modal_probe_retry', reason=type(exc).__name__)
+        return False
 
     async def _login(self, page: Page) -> None:
         state = await self._load_root(page, allow_login=True)
@@ -230,7 +244,6 @@ class PortalCrawler:
             pass_field = page.locator('#password')
             await user_field.fill(self.settings.PORTAL_USERNAME)
             await pass_field.fill(self.settings.PORTAL_PASSWORD)
-
             if (await user_field.input_value() != self.settings.PORTAL_USERNAME or
                     await pass_field.input_value() != self.settings.PORTAL_PASSWORD):
                 raise RuntimeError('Login form did not retain the configured credentials')
@@ -241,43 +254,46 @@ class PortalCrawler:
                 await page.get_by_text('Entrar', exact=True).first.click(
                     timeout=self.settings.PORTAL_TIMEOUT_MS
                 )
-            logger.info('portal_login_clicked', path=urlsplit(page.url).path)
-            await self._confirm_popup_login(page)
-
-            deadline = asyncio.get_running_loop().time() + self.settings.PORTAL_TIMEOUT_MS / 1000
+            logger.info('portal_login_submitted', path=urlsplit(page.url).path)
+            deadline = asyncio.get_running_loop().time() + max(
+                60, self.settings.PORTAL_TIMEOUT_MS / 1000
+            )
+            modal_confirmed = False
             while asyncio.get_running_loop().time() < deadline:
+                if await self._confirm_existing_session(page):
+                    modal_confirmed = True
                 if await self._portal_is_ready(page):
                     break
-                password_visible = await page.locator('#password').is_visible()
-                if not password_visible:
-
-                    try:
-                        await self._load_root(page, allow_login=False)
-                        break
-                    except RuntimeError:
-
-                        pass
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.4)
             else:
                 feedback = await self._login_feedback(page)
                 screenshot = await self._login_debug_screenshot(page)
-                password_still_visible = await page.locator('#password').is_visible()
+                password_visible = await page.locator('#password').is_visible()
+                confirm_visible = False
+                for frame in page.frames:
+                    try:
+                        if await frame.locator('#alertConfirm').is_visible():
+                            confirm_visible = True
+                            break
+                    except Exception:
+                        continue
                 logger.error(
                     'portal_login_not_completed',
                     path=urlsplit(page.url).path,
-                    password_field_visible=password_still_visible,
+                    password_field_visible=password_visible,
+                    session_modal_visible=confirm_visible,
+                    session_modal_confirmed=modal_confirmed,
                     feedback=feedback,
                     screenshot=screenshot,
                 )
                 raise RuntimeError(
                     'SoftExpert login did not complete after clicking Entrar. '
-                    f'Login form visible={password_still_visible}; '
+                    f'Login form visible={password_visible}; '
+                    f'session modal visible={confirm_visible}; '
+                    f'session modal confirmed={modal_confirmed}; '
                     f'messages={feedback!r}; screenshot={screenshot or "unavailable"}. '
-                    'Check credentials, account authorization, MFA and browser/network errors.'
+                    'Check account sessions, credentials, MFA and browser/network errors.'
                 )
-
-            if not await self._portal_is_ready(page):
-                await self._load_root(page, allow_login=False)
         if not await self._portal_is_ready(page):
             raise RuntimeError('Login could not be confirmed: portal tabs are not visible')
         logger.info('portal_login_confirmed', path=urlsplit(page.url).path)
@@ -287,26 +303,27 @@ class PortalCrawler:
         deadline = asyncio.get_running_loop().time() + self.settings.PORTAL_TIMEOUT_MS / 1000
         observed: set[str] = set()
         while asyncio.get_running_loop().time() < deadline:
+            await self._ensure_session(page)
             for frame in page.frames:
                 try:
                     tabs = frame.locator(TAB_SELECTOR)
-
+                    
                     for index in range(min(await tabs.count(), 100)):
                         tab = tabs.nth(index)
                         text = ' '.join((await tab.inner_text(timeout=2000)).split())
                         observed.add(text[:80])
                         if not pattern.fullmatch(text):
                             continue
-
+                        
                         await tab.evaluate('''el => {
                             el.scrollIntoView({block: 'nearest', inline: 'center'});
                         }''')
                         try:
                             await tab.click(timeout=3500)
                         except Exception as click_error:
-
-
-
+                            
+                            
+                            
                             if not await tab.is_visible():
                                 raise click_error
                             await tab.evaluate('''el => {
@@ -317,8 +334,8 @@ class PortalCrawler:
                                 el.click();
                             }''')
                             logger.info('portal_tab_dom_click', tab=label)
-
-
+                        
+                        
                         class_name = await tab.get_attribute('class') or ''
                         if 'FolderTabItemContent' in class_name:
                             try:
@@ -328,6 +345,7 @@ class PortalCrawler:
                                     state='visible', timeout=6000
                                 )
                             except Exception as exc:
+                                await self._ensure_session(page)
                                 raise RuntimeError(
                                     f'Tab {label!r} was clicked but did not become active'
                                 ) from exc
@@ -337,7 +355,7 @@ class PortalCrawler:
                         return
                 except Exception as exc:
                     if type(exc).__name__ in ('TimeoutError', 'Error'):
-
+                        
                         continue
                     raise
             await asyncio.sleep(0.35)
@@ -349,28 +367,63 @@ class PortalCrawler:
 
     async def _click_portal(self, page: Page, action: Action) -> None:
         deadline = asyncio.get_running_loop().time() + self.settings.PORTAL_TIMEOUT_MS / 1000
+        observed: set[str] = set()
+        scroll_steps = 0
         while asyncio.get_running_loop().time() < deadline:
+            await self._ensure_session(page)
             for frame in page.frames:
-                try:
-                    elements = frame.locator(PORTAL_SELECTOR)
-                    filtered = elements.filter(has_text=action.label)
-                    if await filtered.count() > action.occurrence:
-                        tile = filtered.nth(action.occurrence)
-                        await tile.evaluate('el => el.scrollIntoView({block:"center", inline:"center"})')
-                        await tile.click(timeout=min(self.settings.PORTAL_TIMEOUT_MS, 8000))
-                        await self._settle_after_navigation(page)
-                        return
-                    if await elements.count():
-                        await elements.last.evaluate('''el => {
-                            let p = el.parentElement;
-                            while (p && p !== document.body &&
-                                   p.scrollHeight <= p.clientHeight + 8) p=p.parentElement;
-                            if (p) p.scrollTop += Math.max(240, p.clientHeight - 60);
-                        }''')
-                except Exception:
-                    continue
+                widgets = frame.locator('.ActionInitializer.list')
+                for index in range(await widgets.count()):
+                    widget = widgets.nth(index)
+                    try:
+                        if not await widget.is_visible():
+                            continue
+                        tiles = widget.locator(PORTAL_SELECTOR)
+                        matches = await tiles.evaluate_all(r"""(nodes, label) => nodes.flatMap((node, i) => {
+                            for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
+                                const style = getComputedStyle(el);
+                                if (style.display === 'none' || style.visibility === 'hidden') return [];
+                            }
+                            const name = (node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 180);
+                            return name === label ? [i] : [];
+                        })""", action.label)
+                        if len(matches) > action.occurrence:
+                            tile = tiles.nth(matches[action.occurrence])
+                            await tile.evaluate('el => el.scrollIntoView({block:"center",inline:"nearest"})')
+                            button = tile.locator('button').first
+                            target = button if await button.count() and await button.is_visible() else tile
+                            try:
+                                await target.click(timeout=min(3500, self.settings.PORTAL_TIMEOUT_MS))
+                            except Exception:
+                                try:
+                                    await tile.click(timeout=3500)
+                                except Exception:
+                                    await tile.evaluate('el => el.click()')
+                            await self._settle_after_navigation(page)
+                            logger.info('portal_child_opened', portal=action.label)
+                            return
+                        if len(observed) < 30:
+                            observed.update(await tiles.evaluate_all(r"""nodes => nodes
+                                .map(n => (n.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 100))
+                                .filter(Boolean).slice(0, 15)"""))
+                        await widget.evaluate(r"""root => {
+                            let p = root;
+                            while (p && p !== document.body && p.scrollHeight <= p.clientHeight + 8) {
+                                p = p.parentElement;
+                            }
+                            p = p || document.scrollingElement || document.documentElement;
+                            p.scrollTop += Math.max(240, Math.floor(p.clientHeight * 0.75));
+                        }""")
+                        scroll_steps += 1
+                    except Exception as exc:
+                        logger.debug('portal_tile_probe_failed', portal=action.label,
+                                     reason=type(exc).__name__)
             await page.wait_for_timeout(300)
-        raise RuntimeError(f'Portal tile {action.label!r} not found after scrolling frames')
+        raise RuntimeError(
+            f'Portal tile {action.label!r} not found after scrolling through visible lists; '
+            f'frames={len(page.frames)}, scroll_steps={scroll_steps}, '
+            f'observed_tiles={sorted(observed)[:15]!r}'
+        )
 
     async def _click(self, page: Page, action: Action) -> Page:
         existing_pages = set(page.context.pages)
@@ -379,7 +432,10 @@ class PortalCrawler:
                 await self._click_tab(page, action.label)
             else:
                 await self._click_portal(page, action)
+        except PortalSessionExpired:
+            raise
         except Exception as exc:
+            await self._ensure_session(page)
             details = str(exc).strip().replace('\n', ' ')[:600]
             raise RuntimeError(
                 f'Unable to open {action.kind} {action.label!r}: '
@@ -395,8 +451,7 @@ class PortalCrawler:
                 pass
         if origin(page.url) != self.base_origin:
             raise RuntimeError('Portal navigation redirected outside configured host')
-        if await page.locator('#password').count():
-            raise RuntimeError('Portal session expired')
+        await self._ensure_session(page)
         return page
 
     async def _open_node(self, entry: Page, node: Node) -> Page:
@@ -418,67 +473,119 @@ class PortalCrawler:
         await self._wait_tab_dom(page)
         seen: set[str] = set()
         labels: list[str] = []
-
         for frame in page.frames:
             try:
-                for label in await frame.locator(TAB_SELECTOR).all_inner_texts():
-                    name = ' '.join(label.split()).strip()
-                    if name and len(name) <= 100 and name not in seen:
+                items = await frame.locator(TAB_SELECTOR).evaluate_all(r"""nodes => nodes
+                    .filter(node => {
+                        for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
+                            const style = getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden') return false;
+                        }
+                        return node.getClientRects().length > 0;
+                    }).map(node => (node.innerText || '').replace(/\s+/g, ' ').trim())
+                    .filter(Boolean)""")
+                for name in items:
+                    if len(name) <= 100 and name not in seen:
                         seen.add(name)
                         labels.append(name)
             except Exception:
                 continue
-
         if is_root and self.settings.root_tabs:
             allowed = set(self.settings.root_tabs)
+            missing = allowed - set(labels)
+            if missing:
+                self.issues.append(f'Configured root tabs not found: {sorted(missing)!r}')
             labels = [label for label in labels if label in allowed]
         logger.info('portal_tabs_discovered', count=len(labels), tabs=labels[:25],
                     frames=len(page.frames))
         return labels
 
     async def _subportals(self, page: Page) -> list[Action]:
+        await self._ensure_session(page)
         result: list[Action] = []
         seen: set[tuple[str, int]] = set()
         for frame in page.frames:
-            stable = 0
-            for _ in range(120):
+            lists = frame.locator('.ActionInitializer.list')
+            for list_index in range(await lists.count()):
+                widget = lists.nth(list_index)
                 try:
-                    elements = frame.locator(PORTAL_SELECTOR)
-                    items = await elements.evaluate_all(r"""nodes => nodes.filter(node => {
-                        for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
-                            const style = getComputedStyle(el);
-                            if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    if not await widget.is_visible():
+                        continue
+                    await widget.evaluate(r"""root => {
+                        let node = root;
+                        while (node && node !== document.body) {
+                            if (node.scrollHeight > node.clientHeight + 8) {
+                                node.scrollTop = 0;
+                                return;
+                            }
+                            node = node.parentElement;
                         }
-                        return node.getClientRects().length > 0;
-                    }).map(node => (node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 180)).filter(Boolean)""")
-                    new_count = 0
-                    local_counts: dict[str, int] = {}
-                    for label in items:
-                        occurrence = local_counts.get(label, 0)
-                        local_counts[label] = occurrence + 1
-                        key = (label, occurrence)
-                        if key not in seen:
-                            seen.add(key)
-                            result.append(Action('portal', label, occurrence))
-                            new_count += 1
-                    if not items:
-                        break
-                    stable = stable + 1 if not new_count else 0
-                    if stable >= 3:
-                        break
-                    await elements.last.evaluate("""el => {
-                        let parent = el.parentElement;
-                        while (parent && parent !== document.body &&
-                               parent.scrollHeight <= parent.clientHeight + 8) parent = parent.parentElement;
-                        if (parent) parent.scrollTop += Math.max(240, Math.floor(parent.clientHeight * .75));
                     }""")
-                    await page.wait_for_timeout(350)
+                    await page.wait_for_timeout(300)
+                    bottom_checks = 0
+                    for step in range(250):
+                        state = await widget.evaluate(r"""root => {
+                            const visible = node => {
+                                for (let el = node; el && el.nodeType === 1; el = el.parentElement) {
+                                    const style = getComputedStyle(el);
+                                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                                }
+                                return node.getClientRects().length > 0;
+                            };
+                            const nodes = [...root.querySelectorAll('.ActionInitializerItem')];
+                            const items = nodes.filter(visible).map(node =>
+                                (node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 180)
+                            ).filter(Boolean);
+                            let scroller = root;
+                            while (scroller && scroller !== document.body &&
+                                scroller.scrollHeight <= scroller.clientHeight + 8) {
+                                scroller = scroller.parentElement;
+                            }
+                            scroller = scroller || document.scrollingElement || document.documentElement;
+                            const before = scroller.scrollTop;
+                            const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+                            scroller.scrollTop = Math.min(max, before +
+                                Math.max(240, Math.floor(scroller.clientHeight * 0.75)));
+                            return {items, atEnd: before >= max - 2,
+                                    moved: scroller.scrollTop > before + 1};
+                        }""")
+                        new_count = 0
+                        local_counts: dict[str, int] = {}
+                        for label in state['items']:
+                            occurrence = local_counts.get(label, 0)
+                            local_counts[label] = occurrence + 1
+                            key = (label, occurrence)
+                            if key not in seen:
+                                seen.add(key)
+                                result.append(Action('portal', label, occurrence))
+                                new_count += 1
+                        bottom_checks = bottom_checks + 1 if state['atEnd'] and not new_count else 0
+                        if bottom_checks >= 3:
+                            break
+                        await page.wait_for_timeout(350)
+                    else:
+                        self.issues.append(
+                            f'Portal list reached 250-scroll safety limit, frame={urlsplit(frame.url).path}'
+                        )
+                    await widget.evaluate(r"""root => {
+                        let el = root;
+                        while (el && el !== document.body) {
+                            if (el.scrollHeight > el.clientHeight + 8) {
+                                el.scrollTop = 0;
+                                return;
+                            }
+                            el = el.parentElement;
+                        }
+                    }""")
                 except Exception as exc:
-                    logger.warning('portal_list_read_failed', reason=type(exc).__name__, detail=str(exc)[:200])
-                    break
+                    self.issues.append(
+                        f'Portal list navigation incomplete: {type(exc).__name__}: {str(exc)[:180]}'
+                    )
+                    logger.warning('portal_list_read_failed', reason=type(exc).__name__)
         return result
 
     async def _reports(self, page: Page, node: Node) -> list[ReportDescriptor]:
+        await self._ensure_session(page)
         data: list[dict] = []
         for frame in page.frames:
             try:
@@ -520,7 +627,8 @@ class PortalCrawler:
                 logger.warning('report_table_read_failed', reason=type(exc).__name__, detail=str(exc)[:180])
         reports: list[ReportDescriptor] = []
         for item in data:
-            url = item['url']
+            url = re.sub(r'/(?P<record>\d{5,12})administration/ad_report/',
+                         '/administration/ad_report/', item['url'])
             if not allowed_report_url(url, self.allowlist):
                 self.issues.append('Report URL rejected by allowlist')
                 continue
@@ -532,6 +640,7 @@ class PortalCrawler:
         return reports
 
     async def _row_signature(self, page: Page) -> tuple[str, ...]:
+        await self._ensure_session(page)
         signatures: list[str] = []
         for frame in page.frames:
             try:
@@ -551,54 +660,54 @@ class PortalCrawler:
 
     async def _load_more(self, page: Page, before: tuple[str, ...]) -> bool:
         for frame in page.frames:
-            try:
-                rows = frame.locator('tr').filter(has_text=re.compile(r'carregar mais registros', re.I))
-                for index in range(min(await rows.count(), 5)):
-                    row = rows.nth(index)
-                    button = row.get_by_text('Clique aqui', exact=True)
-                    if not await button.count() or not await button.first.is_visible():
-                        continue
-                    await button.first.click(timeout=8000)
-                    deadline = asyncio.get_running_loop().time() + min(20, self.settings.PORTAL_TIMEOUT_MS / 1000)
+            rows = frame.locator('tr').filter(has_text=MORE_TEXT)
+            for index in range(min(await rows.count(), 8)):
+                row = rows.nth(index)
+                if not await row.is_visible():
+                    continue
+                trigger = row.get_by_text(re.compile(r'^\s*clique aqui\s*$', re.I))
+                if not await trigger.count():
+                    trigger = row.locator('span').filter(has_text=re.compile(r'^\s*clique aqui\s*$', re.I))
+                if not await trigger.count():
+                    raise RuntimeError('Load-more row visible but click target is missing')
+                try:
+                    await trigger.first.click(timeout=8000)
+                    deadline = asyncio.get_running_loop().time() + min(
+                        25, self.settings.PORTAL_TIMEOUT_MS / 1000
+                    )
                     while asyncio.get_running_loop().time() < deadline:
-                        await page.wait_for_timeout(450)
+                        await page.wait_for_timeout(500)
+                        await self._ensure_session(page)
                         if await self._row_signature(page) != before:
                             await self._settle_after_navigation(page)
                             return True
                     raise RuntimeError('Load more was clicked but the table did not advance')
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                raise RuntimeError(f'Unable to load more rows: {type(exc).__name__}: {str(exc)[:200]}') from exc
+                except Exception as exc:
+                    raise RuntimeError(
+                        f'Unable to load more rows: {type(exc).__name__}: {str(exc)[:200]}'
+                    ) from exc
         return False
-
-    async def _scroll_dashboards(self, page: Page) -> None:
-        for frame in page.frames:
-            try:
-                cards = frame.locator(".dashboardCard:visible")
-
-                for index in range(await cards.count()):
-                    await cards.nth(index).scroll_into_view_if_needed()
-                    await asyncio.sleep(0.15)
-            except PlaywrightTimeoutError as exc:
-                logger.warning('dashboard_scroll_timeout', reason=type(exc).__name__, detail=str(exc)[:200])
-            await page.wait_for_timeout(300)
 
     async def crawl(self, job: SyncJob,
                     on_report: Callable[[ReportDescriptor, BrowserContext], Awaitable[None]],
-                    heartbeat: Callable[[], Awaitable[None]]) -> int:
+                    heartbeat: Callable[[], Awaitable[None]],
+                    on_node: Callable[[Node, str, str], Awaitable[None]] | None = None) -> int:
         opts = job.options
         max_depth = opts.get('max_depth', 3 if job.mode == 'test' else 12)
         max_portals = opts.get('max_portals', 3 if job.mode == 'test' else 0)
         max_reports = opts.get('max_reports', 5 if job.mode == 'test' else 0)
         visited_nodes: set[tuple[Action, ...]] = set()
-        visited_reports: set[str] = set()
+        visited_reports: set[tuple[str, tuple[Action, ...]]] = set()
         queue: deque[Node] = deque([Node()])
         portal_count = 0
         node_count = 0
-
+        reauthentication_count = 0
+        recovery_attempts: dict[tuple[Action, ...], int] = {}
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True, args=['--disable-dev-shm-usage'])
+            browser = await playwright.chromium.launch(
+                headless=True, args=['--disable-dev-shm-usage'],
+                downloads_path=str(self.settings.TEMP_DIR)
+            )
             context = await browser.new_context(accept_downloads=True, viewport={"width": 1600, "height": 960})
             try:
                 entry = await context.new_page()
@@ -609,8 +718,8 @@ class PortalCrawler:
                     node = queue.popleft()
                     if node.actions in visited_nodes or node.depth > max_depth:
                         continue
-
-
+                    
+                    
                     is_portal_node = not node.actions or node.actions[-1].kind == 'portal'
                     if is_portal_node and max_portals and portal_count >= max_portals:
                         continue
@@ -623,7 +732,9 @@ class PortalCrawler:
                     try:
                         page = await self._open_node(entry, node)
                         logger.info('scraping_node', level=node.depth, trail=node.trail, tab=node.tab)
-
+                        if on_node:
+                            await on_node(node,'visited',f'Profundidade {node.depth}')
+                        
                         if not node.actions or node.actions[-1].kind == 'portal':
                             tabs = await self._tabs(page, is_root=not node.actions)
                             for tab in tabs:
@@ -632,13 +743,15 @@ class PortalCrawler:
                                 if child.actions not in visited_nodes:
                                     queue.append(child)
                         reports_in_node = 0
+                        pagination_clicks = 0
                         for page_number in range(2000):
                             await heartbeat()
                             for report in await self._reports(page, node):
                                 identity = source_identity(report.url)
-                                if identity in visited_reports:
+                                key = (identity, node.actions)
+                                if key in visited_reports:
                                     continue
-                                visited_reports.add(identity)
+                                visited_reports.add(key)
                                 reports_in_node += 1
                                 await on_report(report, context)
                                 if max_reports and len(visited_reports) >= max_reports:
@@ -649,8 +762,11 @@ class PortalCrawler:
                             try:
                                 if not await self._load_more(page, before):
                                     break
+                                pagination_clicks += 1
                                 logger.info('portal_more_records_loaded', tab=node.tab,
                                             trail=node.trail, page=page_number + 2)
+                            except PortalSessionExpired:
+                                raise
                             except Exception as exc:
                                 self.issues.append(
                                     f'Pagination incomplete in {node.trail}/{node.tab}: {type(exc).__name__}: {str(exc)[:180]}'
@@ -660,6 +776,9 @@ class PortalCrawler:
                                 break
                         else:
                             self.issues.append('Pagination reached safety cap of 2000 clicks')
+                        if pagination_clicks and on_node:
+                            await on_node(node,'pagination',
+                                          f'{pagination_clicks} cliques em carregar mais registros')
                         if reports_in_node == 0:
                             logger.info('portal_tab_no_reports', trail=node.trail, tab=node.tab)
                         if max_reports and len(visited_reports) >= max_reports:
@@ -675,9 +794,39 @@ class PortalCrawler:
                                                   node.depth + 1, 'Geral')
                                 if child_node.actions not in visited_nodes:
                                     queue.append(child_node)
+                    except PortalSessionExpired as exc:
+                        attempts = recovery_attempts.get(node.actions, 0) + 1
+                        recovery_attempts[node.actions] = attempts
+                        logger.warning(
+                            'portal_session_expired',
+                            trail=node.trail,
+                            tab=node.tab,
+                            attempt=attempts,
+                            total_reauthentications=reauthentication_count,
+                        )
+                        if attempts > 2 or reauthentication_count >= 100:
+                            raise RuntimeError(
+                                'Portal authentication repeatedly expired; '
+                                'the crawler stopped to avoid losing navigation coverage'
+                            ) from exc
+                        await self._login(entry)
+                        reauthentication_count += 1
+                        logger.info(
+                            'portal_session_reauthenticated',
+                            attempt=attempts,
+                            total_reauthentications=reauthentication_count,
+                            trail=node.trail,
+                        )
+                        visited_nodes.discard(node.actions)
+                        node_count -= 1
+                        if is_portal_node:
+                            portal_count -= 1
+                        queue.appendleft(node)
                     except Exception as exc:
                         message = f'Navigation failed at {node.trail}: {type(exc).__name__}: {exc}'
                         self.issues.append(message[:500])
+                        if on_node:
+                            await on_node(node,'navigation_failed',message[:500])
                         logger.warning('portal_navigation_failed', trail=node.trail,
                                        tab=node.tab,
                                        actions=[f'{a.kind}:{a.label}' for a in node.actions],

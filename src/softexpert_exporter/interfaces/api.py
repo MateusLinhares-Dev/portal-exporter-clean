@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hmac
-from datetime import UTC, date, datetime
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Annotated, cast, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -20,6 +21,7 @@ class SyncRequest(BaseModel):
     window_start: date | None = None
     window_end: date | None = None
     force: bool = False
+    dry_run: bool = False
 
 class SyncResponse(BaseModel):
     job_id: str
@@ -43,6 +45,9 @@ class JobResponse(BaseModel):
     skipped: int
     failed: int
     error_summary: str | None
+    report_path: str | None
+    report_generated_at: datetime | None
+    report_error: str | None
 
 def container_from(request: Request) -> Container:
     return cast(Container, request.app.state.container)
@@ -60,27 +65,32 @@ def to_response(job: SyncJob) -> JobResponse:
              dependencies=[Depends(require_api_key)])
 async def create_sync(body: SyncRequest, container: Annotated[Container, Depends(container_from)]) -> SyncResponse:
     options = body.model_dump(exclude={'requested_by', 'mode'}, exclude_none=True)
+    today = datetime.now(ZoneInfo(container.settings.SCHEDULER_TIMEZONE)).date()
     if body.mode == 'test':
         options.setdefault('max_reports', 5)
         options.setdefault('max_portals', 3)
         options.setdefault('max_depth', 3)
         # Evita disparar extração integral acidental via modo teste
-        if options['max_reports'] == 0 or options['max_portals'] == 0:
-            raise HTTPException(status_code=422, detail='Test mode requires positive max_reports and max_portals')
+        if options['max_reports'] == 0:
+            raise HTTPException(status_code=422, detail='Test mode requires a positive max_reports')
+        if options['max_portals'] == 0 and not body.dry_run:
+            raise HTTPException(status_code=422, detail='Unlimited test portals require dry_run=true')
+    if body.mode != 'test' and body.dry_run:
+        raise HTTPException(status_code=422, detail='dry_run is only supported in test mode')
     if body.mode == 'historical':
         cutoff = body.cutoff_date or container.settings.HISTORICAL_CUTOFF_DATE
         if cutoff is None:
             raise HTTPException(status_code=422,
                 detail='Historical job requires cutoff_date (approval date) or HISTORICAL_CUTOFF_DATE')
-        if cutoff > datetime.now(UTC).date():
+        if cutoff > today:
             raise HTTPException(status_code=422, detail='cutoff_date cannot be in the future')
         options['cutoff_date'] = cutoff.isoformat()
         options.pop('window_start', None)
         options.pop('window_end', None)
     elif body.mode == 'incremental':
-        end = body.window_end or datetime.now(UTC).date()
+        end = body.window_end or today
         start = body.window_start or previous_six_months(end)
-        if start >= end or end > datetime.now(UTC).date():
+        if start >= end or end > today:
             raise HTTPException(status_code=422, detail='Require window_start < window_end <= today')
         options['window_start'] = start.isoformat()
         options['window_end'] = end.isoformat()
@@ -88,6 +98,9 @@ async def create_sync(body: SyncRequest, container: Annotated[Container, Depends
     else:
         for item in ('window_start', 'window_end', 'cutoff_date'):
             options.pop(item, None)
+    if not (body.mode == 'test' and body.dry_run):
+        if not await container.storage.is_ready():
+            raise HTTPException(status_code=503, detail='CIFS share not mounted or not writable')
     job = await container.repository.create_job(body.requested_by, body.mode, options)
     return SyncResponse(job_id=job.id, status=job.status.value, mode=job.mode)
 

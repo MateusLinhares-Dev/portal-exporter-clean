@@ -42,3 +42,6 @@ class SyncJob:
     skipped: int = 0
     failed: int = 0
     error_summary: str | None = None
+    report_path: str | None = None
+    report_generated_at: datetime | None = None
+    report_error: str | None = None

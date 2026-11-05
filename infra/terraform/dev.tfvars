@@ -1,15 +1,9 @@
 project_name = "softexpert-portal-exporter-dev"
 
-aws_region    = "sa-east-1"
-vpc_id        = "vpc-REAL"
-app_subnet_id = "subnet-REAL"
+aws_region    = "us-east-1"
 
-db_subnet_ids = [
-  "subnet-A",
-  "subnet-B"
-]
+app_subnet_id = "subnet-0222770d28f5abe9e"
 
-ami_id        = "ami-AMAZON-LINUX-2023"
 instance_type = "t3.medium"
 
 api_ingress_cidrs = []

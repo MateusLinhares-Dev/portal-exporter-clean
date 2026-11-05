@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     NETWORK_SHARE_ROOT: Path = Path('/mnt/client-share')
     NETWORK_SHARE_REQUIRE_SENTINEL: bool = False
+    NETWORK_SHARE_REQUIRE_CIFS: bool = True
     NETWORK_SHARE_SENTINEL_NAME: str = 'softexpert-exporter-share.ready'
     TEMP_DIR: Path = Path('/tmp/softexpert-exporter')
     WORKER_POLL_SECONDS: float = Field(default=5, gt=0)
@@ -51,8 +52,8 @@ class Settings(BaseSettings):
         if self.APP_ENV == 'production':
             if not self.APP_API_KEY or self.APP_API_KEY == 'change-me':
                 raise ValueError('Set a strong APP_API_KEY in production')
-            if not self.NETWORK_SHARE_REQUIRE_SENTINEL:
-                raise ValueError('Require network-share sentinel in production')
+            if not self.NETWORK_SHARE_REQUIRE_SENTINEL or not self.NETWORK_SHARE_REQUIRE_CIFS:
+                raise ValueError('Production requires sentinel and CIFS mount validation')
         return self
 
     @property

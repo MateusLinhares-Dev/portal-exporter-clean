@@ -8,27 +8,14 @@ variable "aws_region" {
   default = "sa-east-1"
 }
 
-variable "vpc_id" {
-  type = string
-}
-
-variable "app_subnet_id" {
-  type = string
-}
-
-variable "db_subnet_ids" {
-  type        = list(string)
-  description = "At least two subnets in different AZs for RDS subnet group."
-}
-
-variable "ami_id" {
-  type        = string
-  description = "Amazon Linux 2023 AMI ID validated by the customer."
-}
-
 variable "instance_type" {
   type    = string
   default = "t3.small"
+}
+
+variable "app_subnet_id" {
+  type        = string
+  description = "Subnet privada utilizada pela EC2"
 }
 
 variable "root_volume_size_gb" {
